@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-upload-${AWS::Region}
+    DeletionPolicy: Delete
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-output-${AWS::Region}
+    DeletionPolicy: Delete
+  NotifyWhenCompeted:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-sns-topic-textract-done-${AWS::Region}
+      KmsMasterKeyId: alias/aws/sns
+  StartDetectTextJob:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-start-detect-text-${AWS::Region}'
+      Handler: start_text_detect_from_pdf.handler
+      Runtime: python3.12
+      CodeUri: src/lambda/start_text/
+      Description: A lambda to start Textract Job
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotifyWhenCompeted
+          SNS_ROLE_ARN: !GetAtt NotifyWhenCompetedRole.Arn
+      Role: !GetAtt StartDetectTextJobRole.Arn
+      Events:
+        BucketUploadEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events:
+              - s3:ObjectCreated:*
+  GetDetectTextJobOutput:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-get-detect-text-${AWS::Region}
+      Handler: get_text_detect_from_pdf.handler
+      Runtime: python3.12
+      CodeUri: src/lambda/get_text/
+      Description: A lambda to get then return of a Textract Job
+      MemorySize: 512
+      Timeout: 30
+      Layers:
+        - arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python311:4
+      Environment:
+        Variables:
+          OUT_PUT_S3_BUCKET: !Ref OutputBucket
+          GLUE_CATALOG_DB_NAME: ocr_docs
+          GLUE_CATALOG_TABLE_NAME: ocr_docs_index
+      Role: !GetAtt GetDetectTextJobOutputRole.Arn
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref NotifyWhenCompeted
+  StartDetectTextJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  StartDetectTextJobRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: StartDetectTextJobRolePolicyRolePolicy
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::*${AWS::StackName}-upload*/*
+          - Effect: Allow
+            Action:
+              - textract:StartDocumentTextDetection
+            Resource: '*'
+      Roles:
+        - !Ref StartDetectTextJobRole
+  GetDetectTextJobOutputRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  GetDetectTextJobOutputRolePolicies:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: GetDetectTextJobOutputRolePolicy
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - textract:GetDocumentTextDetection
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: !Sub arn:aws:s3:::*${AWS::StackName}-output*/*
+          - Effect: Allow
+            Action:
+              - glue:CreateDatabase
+              - glue:CreateTable
+              - glue:GetTable
+            Resource:
+              - arn:aws:glue:*:559973966803:catalog
+              - arn:aws:glue:*:559973966803:database/*
+              - arn:aws:glue:*:559973966803:table/*/*
+      Roles:
+        - !Ref GetDetectTextJobOutputRole
+  NotifyWhenCompetedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - textract.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub arn:aws:sns:*:*:*${AWS::StackName}-sns-topic*
+  AthenaNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: default
+      Description: A query that selects all aggregated data
+      Name: CreateDocsIndexTable
+      QueryString: !Sub |
+        CREATE EXTERNAL TABLE IF NOT EXISTS `default`.`docs` (
+            `document` string,
+            `page` bigint,
+            `content` string
+        ) ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe' STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'  OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat' LOCATION 's3://${AWS::StackName}-output-us-east-1/' TBLPROPERTIES ('classification' = 'parquet')
+Metadata:
+  AWS::Composer::Groups:
+    Group:
+      Label: StartDetectText
+      Members:
+        - StartDetectTextJob
+        - StartDetectTextJobRole
+    Group2:
+      Label: GetDetectText
+      Members:
+        - GetDetectTextJobOutputRole
+        - GetDetectTextJobOutput
+    Group3:
+      Label: Notify
+      Members:
+        - NotifyWhenCompeted
+        - NotifyWhenCompetedRole
